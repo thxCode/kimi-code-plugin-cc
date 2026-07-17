@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "allowJs": true,
+    "checkJs": true,
+    "noEmit": true,
+    "strict": false,
+    "noImplicitAny": false,
+    "useUnknownInCatchVariables": false,
+    "skipLibCheck": true,
+    "types": ["node"]
+  },
+  "include": [
+    "plugins/kimi/scripts/lib/acp-client.mjs",
+    "plugins/kimi/scripts/lib/kimi.mjs",
+    "plugins/kimi/scripts/lib/fs.mjs",
+    "plugins/kimi/scripts/lib/process.mjs",
+    "plugins/kimi/scripts/lib/acp-protocol.d.ts"
+  ]
+}
