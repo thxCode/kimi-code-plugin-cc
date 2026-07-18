@@ -11,8 +11,12 @@ import { resolveStateDir } from "./state.mjs";
 export const PID_FILE_ENV = "KIMI_COMPANION_ACP_PID_FILE";
 export const LOG_FILE_ENV = "KIMI_COMPANION_ACP_LOG_FILE";
 const BROKER_STATE_FILE = "broker.json";
+// Temp-dir prefix for broker sessions spawned by THIS plugin. Sibling
+// companion plugins (e.g. Codex uses "cxc-") pick a different prefix, which
+// is what lets a cached broker session be attributed to its owner.
+export const BROKER_SESSION_DIR_PREFIX = "kxc-";
 
-export function createBrokerSessionDir(prefix = "kxc-") {
+export function createBrokerSessionDir(prefix = BROKER_SESSION_DIR_PREFIX) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
 
@@ -86,6 +90,42 @@ export function readBrokerSession(cwd) {
   }
 }
 
+/**
+ * True when a cached broker session was spawned by this plugin: its session
+ * dir carries the kimi broker prefix and the endpoint lives inside that dir.
+ * A session file can describe a FOREIGN broker when a sibling companion
+ * plugin resolves the same state root (shared CLAUDE_PLUGIN_DATA) and writes
+ * its own broker.json there — such a broker must never be reused, shut down,
+ * or killed by this plugin.
+ */
+export function isOwnBrokerSession(session) {
+  if (!session || typeof session !== "object") {
+    return false;
+  }
+  const sessionDir = typeof session.sessionDir === "string" ? session.sessionDir : null;
+  if (!sessionDir || !path.basename(sessionDir).startsWith(BROKER_SESSION_DIR_PREFIX)) {
+    return false;
+  }
+  if (typeof session.endpoint !== "string" || session.endpoint.length === 0) {
+    return false;
+  }
+  try {
+    const target = parseBrokerEndpoint(session.endpoint);
+    if (target.kind === "unix") {
+      return path.dirname(target.path) === path.normalize(sessionDir);
+    }
+    // Windows pipe names are derived from the session dir basename.
+    return target.path.includes(path.basename(sessionDir));
+  } catch {
+    return false;
+  }
+}
+
+export function readOwnBrokerSession(cwd) {
+  const session = readBrokerSession(cwd);
+  return isOwnBrokerSession(session) ? session : null;
+}
+
 export function saveBrokerSession(cwd, session) {
   const stateDir = resolveStateDir(cwd);
   fs.mkdirSync(stateDir, { recursive: true });
@@ -112,19 +152,23 @@ async function isBrokerEndpointReady(endpoint) {
 
 export async function ensureBrokerSession(cwd, options = {}) {
   const existing = readBrokerSession(cwd);
-  if (existing && (await isBrokerEndpointReady(existing.endpoint))) {
+  if (existing && isOwnBrokerSession(existing) && (await isBrokerEndpointReady(existing.endpoint))) {
     return existing;
   }
 
   if (existing) {
-    teardownBrokerSession({
-      endpoint: existing.endpoint ?? null,
-      pidFile: existing.pidFile ?? null,
-      logFile: existing.logFile ?? null,
-      sessionDir: existing.sessionDir ?? null,
-      pid: existing.pid ?? null,
-      killProcess: options.killProcess ?? null
-    });
+    if (isOwnBrokerSession(existing)) {
+      teardownBrokerSession({
+        endpoint: existing.endpoint ?? null,
+        pidFile: existing.pidFile ?? null,
+        logFile: existing.logFile ?? null,
+        sessionDir: existing.sessionDir ?? null,
+        pid: existing.pid ?? null,
+        killProcess: options.killProcess ?? null
+      });
+    }
+    // A foreign session is never torn down — the broker it describes belongs
+    // to someone else. Just drop the stale record from our state dir.
     clearBrokerSession(cwd);
   }
 

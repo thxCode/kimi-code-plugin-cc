@@ -7,13 +7,14 @@ import { terminateProcessTree } from "./lib/process.mjs";
 import { BROKER_ENDPOINT_ENV } from "./lib/acp-client.mjs";
 import {
   clearBrokerSession,
+  isOwnBrokerSession,
   LOG_FILE_ENV,
   PID_FILE_ENV,
   readBrokerSession,
   sendBrokerShutdown,
   teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
-import { loadState, resolveStateFile, saveState } from "./lib/state.mjs";
+import { loadState, resolveStateFile, saveState, KIMI_PLUGIN_DATA_ENV } from "./lib/state.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { SESSION_ID_ENV } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
@@ -77,13 +78,22 @@ function cleanupSessionJobs(cwd, sessionId) {
 function handleSessionStart(input) {
   appendEnvVar(SESSION_ID_ENV, input.session_id);
   appendEnvVar(TRANSCRIPT_PATH_ENV, input.transcript_path);
-  appendEnvVar(PLUGIN_DATA_ENV, process.env[PLUGIN_DATA_ENV]);
+  // Export a kimi-specific plugin-data pointer rather than re-exporting
+  // CLAUDE_PLUGIN_DATA: sibling companion plugins re-export the same generic
+  // variable into this shared env file, so the last hook to run wins and the
+  // losing plugin's workers then resolve the winner's state root — reading
+  // and even writing each other's broker.json.
+  appendEnvVar(KIMI_PLUGIN_DATA_ENV, process.env[PLUGIN_DATA_ENV]);
 }
 
 async function handleSessionEnd(input) {
   const cwd = input.cwd || process.cwd();
+  // A cached session describing a FOREIGN broker (e.g. written by a sibling
+  // companion plugin sharing this state root) must not be shut down or
+  // killed here — only its stale record is removed below.
+  const fileSession = readBrokerSession(cwd);
   const brokerSession =
-    readBrokerSession(cwd) ??
+    (isOwnBrokerSession(fileSession) ? fileSession : null) ??
     (process.env[BROKER_ENDPOINT_ENV]
       ? {
           endpoint: process.env[BROKER_ENDPOINT_ENV],

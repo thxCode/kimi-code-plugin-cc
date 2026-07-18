@@ -42,7 +42,7 @@ import {
   respondPermission,
   withAcpClient
 } from "./acp-client.mjs";
-import { readBrokerSession } from "./broker-lifecycle.mjs";
+import { readOwnBrokerSession } from "./broker-lifecycle.mjs";
 import { compressClaudeTranscript } from "./claude-session-transfer.mjs";
 import { readJsonFile } from "./fs.mjs";
 import { binaryAvailable } from "./process.mjs";
@@ -220,7 +220,7 @@ export function getKimiAvailability(cwd) {
 }
 
 export function getSessionRuntimeStatus(env = process.env, cwd = process.cwd()) {
-  const endpoint = env?.[BROKER_ENDPOINT_ENV] ?? readBrokerSession(cwd)?.endpoint ?? null;
+  const endpoint = env?.[BROKER_ENDPOINT_ENV] ?? readOwnBrokerSession(cwd)?.endpoint ?? null;
   if (endpoint) {
     return {
       mode: "shared",

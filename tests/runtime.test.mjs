@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeKimi } from "./fake-kimi-fixture.mjs";
 import { initGitRepo, makeTempDir, run, scrubEnv } from "./helpers.mjs";
-import { readBrokerSession, saveBrokerSession } from "../plugins/kimi/scripts/lib/broker-lifecycle.mjs";
+import { isOwnBrokerSession, readBrokerSession, readOwnBrokerSession, saveBrokerSession } from "../plugins/kimi/scripts/lib/broker-lifecycle.mjs";
 import { terminateProcessTree } from "../plugins/kimi/scripts/lib/process.mjs";
 import { resolveStateDir } from "../plugins/kimi/scripts/lib/state.mjs";
 
@@ -21,6 +21,7 @@ const PLUGIN_ROOT = path.join(ROOT, "plugins", "kimi");
 const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "kimi-companion.mjs");
 const STOP_HOOK = path.join(PLUGIN_ROOT, "scripts", "stop-review-gate-hook.mjs");
 const SESSION_HOOK = path.join(PLUGIN_ROOT, "scripts", "session-lifecycle-hook.mjs");
+const FOREIGN_BROKER_FIXTURE = path.join(ROOT, "tests", "fake-foreign-broker-fixture.mjs");
 
 async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
   const start = Date.now();
@@ -1738,9 +1739,11 @@ test("session start hook exports the Claude session id, transcript path, and plu
   });
 
   assert.equal(result.status, 0, result.stderr);
+  // The hook exports a kimi-specific plugin-data pointer, NOT the generic
+  // CLAUDE_PLUGIN_DATA that sibling companion plugins race to overwrite.
   assert.equal(
     fs.readFileSync(envFile, "utf8"),
-    `export KIMI_COMPANION_SESSION_ID='sess-current'\nexport KIMI_COMPANION_TRANSCRIPT_PATH='${transcriptPath}'\nexport CLAUDE_PLUGIN_DATA='${pluginDataDir}'\n`
+    `export KIMI_COMPANION_SESSION_ID='sess-current'\nexport KIMI_COMPANION_TRANSCRIPT_PATH='${transcriptPath}'\nexport KIMI_COMPANION_PLUGIN_DATA='${pluginDataDir}'\n`
   );
 });
 
@@ -2142,8 +2145,13 @@ test("setup and status honor --cwd when reading shared session runtime", (t) => 
   const invocationWorkspace = makeTempDir();
   const { env } = makeTestEnv(t);
 
+  const brokerSessionDir = makeTempDir("kxc-");
   saveBrokerSession(targetWorkspace, {
-    endpoint: "unix:/tmp/fake-broker.sock"
+    endpoint: `unix:${path.join(brokerSessionDir, "broker.sock")}`,
+    pidFile: path.join(brokerSessionDir, "broker.pid"),
+    logFile: path.join(brokerSessionDir, "broker.log"),
+    sessionDir: brokerSessionDir,
+    pid: null
   });
 
   const status = run("node", [SCRIPT, "status", "--cwd", targetWorkspace], {
@@ -2160,5 +2168,196 @@ test("setup and status honor --cwd when reading shared session runtime", (t) => 
   assert.equal(setup.status, 0, setup.stderr);
   const payload = JSON.parse(setup.stdout);
   assert.equal(payload.sessionRuntime.mode, "shared");
-  assert.equal(payload.sessionRuntime.endpoint, "unix:/tmp/fake-broker.sock");
+  assert.equal(payload.sessionRuntime.endpoint, `unix:${path.join(brokerSessionDir, "broker.sock")}`);
+});
+
+test("status ignores a cached broker session that belongs to a foreign plugin", (t) => {
+  const targetWorkspace = makeTempDir();
+  const invocationWorkspace = makeTempDir();
+  const { env } = makeTestEnv(t);
+
+  // Shaped exactly like a sibling plugin's broker session (Codex uses the
+  // "cxc-" prefix) leaked into this state root.
+  const foreignSessionDir = makeTempDir("cxc-");
+  saveBrokerSession(targetWorkspace, {
+    endpoint: `unix:${path.join(foreignSessionDir, "broker.sock")}`,
+    pidFile: path.join(foreignSessionDir, "broker.pid"),
+    logFile: path.join(foreignSessionDir, "broker.log"),
+    sessionDir: foreignSessionDir,
+    pid: null
+  });
+
+  const status = run("node", [SCRIPT, "status", "--cwd", targetWorkspace], {
+    cwd: invocationWorkspace,
+    env
+  });
+  assert.equal(status.status, 0, status.stderr);
+  assert.match(status.stdout, /Session runtime: direct startup/);
+});
+
+test("isOwnBrokerSession only accepts sessions this plugin spawned", (t) => {
+  const ownDir = makeTempDir("kxc-");
+  const foreignDir = makeTempDir("cxc-");
+
+  assert.equal(
+    isOwnBrokerSession({
+      endpoint: `unix:${path.join(ownDir, "broker.sock")}`,
+      pidFile: path.join(ownDir, "broker.pid"),
+      logFile: path.join(ownDir, "broker.log"),
+      sessionDir: ownDir,
+      pid: 1234
+    }),
+    true
+  );
+  // Sibling plugin's session (different temp-dir prefix).
+  assert.equal(
+    isOwnBrokerSession({
+      endpoint: `unix:${path.join(foreignDir, "broker.sock")}`,
+      sessionDir: foreignDir,
+      pid: 1234
+    }),
+    false
+  );
+  // Endpoint living outside the recorded session dir.
+  assert.equal(
+    isOwnBrokerSession({ endpoint: "unix:/tmp/somewhere-else/broker.sock", sessionDir: ownDir }),
+    false
+  );
+  // Hand-written or legacy sessions without a session dir are not provably ours.
+  assert.equal(isOwnBrokerSession({ endpoint: "unix:/tmp/fake-broker.sock" }), false);
+  assert.equal(isOwnBrokerSession(null), false);
+  assert.equal(isOwnBrokerSession({}), false);
+
+  const workspace = makeTempDir();
+  makeTestEnv(t);
+  saveBrokerSession(workspace, { endpoint: `unix:${path.join(foreignDir, "broker.sock")}`, sessionDir: foreignDir });
+  assert.equal(readOwnBrokerSession(workspace), null);
+  saveBrokerSession(workspace, {
+    endpoint: `unix:${path.join(ownDir, "broker.sock")}`,
+    sessionDir: ownDir,
+    pid: null
+  });
+  assert.equal(readOwnBrokerSession(workspace)?.sessionDir, ownDir);
+});
+
+test("a foreign cached broker session is replaced, never reused, and its broker is left running", (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeKimi(binDir);
+  const { env } = makeTestEnv(t, binDir);
+  scheduleBrokerCleanup(t, repo, env);
+  initRepoWithCommit(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
+
+  // The "foreign broker": a live process a torn-down session must not kill
+  // (in the incident this was Codex's app-server broker, pid 49825).
+  const foreignBroker = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    cwd: repo,
+    detached: true,
+    stdio: "ignore"
+  });
+  foreignBroker.unref();
+  t.after(() => {
+    try {
+      process.kill(-foreignBroker.pid, "SIGTERM");
+    } catch {
+      try {
+        process.kill(foreignBroker.pid, "SIGTERM");
+      } catch {
+        // Ignore missing process.
+      }
+    }
+  });
+
+  const foreignSessionDir = makeTempDir("cxc-");
+  fs.writeFileSync(path.join(foreignSessionDir, "broker.pid"), `${foreignBroker.pid}\n`, "utf8");
+  saveBrokerSession(repo, {
+    endpoint: `unix:${path.join(foreignSessionDir, "broker.sock")}`,
+    pidFile: path.join(foreignSessionDir, "broker.pid"),
+    logFile: path.join(foreignSessionDir, "broker.log"),
+    sessionDir: foreignSessionDir,
+    pid: foreignBroker.pid
+  });
+
+  const review = run("node", [SCRIPT, "review"], {
+    cwd: repo,
+    env
+  });
+  assert.equal(review.status, 0, review.stderr);
+
+  // The foreign broker process was NOT torn down or killed…
+  assert.doesNotThrow(() => process.kill(foreignBroker.pid, 0));
+  assert.equal(fs.existsSync(path.join(foreignSessionDir, "broker.pid")), true);
+
+  // …and the poisoned record was replaced by our own freshly spawned broker.
+  const brokerSession = readBrokerSession(repo);
+  assert.ok(brokerSession);
+  assert.equal(isOwnBrokerSession(brokerSession), true);
+  assert.match(path.basename(brokerSession.sessionDir), /^kxc-/);
+
+  const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({
+      hook_event_name: "SessionEnd",
+      cwd: repo
+    })
+  });
+  assert.equal(cleanup.status, 0, cleanup.stderr);
+  assert.doesNotThrow(() => process.kill(foreignBroker.pid, 0));
+});
+
+test("a broker that fails the Kimi handshake is rejected and the run falls back to direct", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeKimi(binDir);
+  const { env } = makeTestEnv(t, binDir);
+  scheduleBrokerCleanup(t, repo, env);
+  initRepoWithCommit(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
+
+  // A live FOREIGN broker hiding behind an own-shaped session record: the
+  // socket connect succeeds, so only the handshake can unmask it.
+  const brokerSessionDir = makeTempDir("kxc-");
+  const socketPath = path.join(brokerSessionDir, "broker.sock");
+  const foreignBroker = spawn(process.execPath, [FOREIGN_BROKER_FIXTURE, socketPath], {
+    cwd: repo,
+    detached: true,
+    stdio: "ignore"
+  });
+  foreignBroker.unref();
+  t.after(() => {
+    try {
+      process.kill(-foreignBroker.pid, "SIGTERM");
+    } catch {
+      try {
+        process.kill(foreignBroker.pid, "SIGTERM");
+      } catch {
+        // Ignore missing process.
+      }
+    }
+  });
+  await waitFor(() => fs.existsSync(socketPath) || null);
+
+  saveBrokerSession(repo, {
+    endpoint: `unix:${socketPath}`,
+    pidFile: path.join(brokerSessionDir, "broker.pid"),
+    logFile: path.join(brokerSessionDir, "broker.log"),
+    sessionDir: brokerSessionDir,
+    pid: foreignBroker.pid
+  });
+
+  const review = run("node", [SCRIPT, "review"], {
+    cwd: repo,
+    env
+  });
+  assert.equal(review.status, 0, review.stderr);
+
+  // The poisoned session record was cleared and no new broker was cached;
+  // the review completed over a direct `kimi acp` connection instead.
+  assert.equal(readBrokerSession(repo), null);
+  assert.equal(readFakeState(binDir).acpStarts, 1);
+
+  // The foreign broker was not killed either.
+  assert.doesNotThrow(() => process.kill(foreignBroker.pid, 0));
 });

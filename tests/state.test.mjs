@@ -40,6 +40,36 @@ test("resolveStateDir uses CLAUDE_PLUGIN_DATA when it is provided", () => {
   }
 });
 
+test("resolveStateDir prefers KIMI_COMPANION_PLUGIN_DATA over CLAUDE_PLUGIN_DATA", () => {
+  const workspace = makeTempDir();
+  const kimiDataDir = makeTempDir();
+  const foreignDataDir = makeTempDir();
+  const previousKimiDataDir = process.env.KIMI_COMPANION_PLUGIN_DATA;
+  const previousPluginDataDir = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.KIMI_COMPANION_PLUGIN_DATA = kimiDataDir;
+  // Simulates the session-env race: a sibling plugin's SessionStart hook
+  // re-exported the generic variable after ours and pointed it at ITS root.
+  process.env.CLAUDE_PLUGIN_DATA = foreignDataDir;
+
+  try {
+    const stateDir = resolveStateDir(workspace);
+
+    assert.equal(stateDir.startsWith(path.join(kimiDataDir, "state")), true);
+    assert.equal(stateDir.startsWith(path.join(foreignDataDir, "state")), false);
+  } finally {
+    if (previousKimiDataDir == null) {
+      delete process.env.KIMI_COMPANION_PLUGIN_DATA;
+    } else {
+      process.env.KIMI_COMPANION_PLUGIN_DATA = previousKimiDataDir;
+    }
+    if (previousPluginDataDir == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previousPluginDataDir;
+    }
+  }
+});
+
 test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", () => {
   const workspace = makeTempDir();
   const stateFile = resolveStateFile(workspace);

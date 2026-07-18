@@ -7,6 +7,12 @@ import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 const STATE_VERSION = 1;
 const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
+// Kimi-specific plugin-data pointer. SessionStart exports this into the
+// session environment instead of CLAUDE_PLUGIN_DATA: sibling companion
+// plugins (e.g. Codex) re-export the same generic variable, so the last
+// hook to run used to win and both plugins' workers resolved one shared
+// state root — including each other's broker.json.
+export const KIMI_PLUGIN_DATA_ENV = "KIMI_COMPANION_PLUGIN_DATA";
 const FALLBACK_STATE_ROOT_DIR = path.join(os.tmpdir(), "kimi-companion");
 const STATE_FILE_NAME = "state.json";
 const JOBS_DIR_NAME = "jobs";
@@ -38,7 +44,7 @@ export function resolveStateDir(cwd) {
   const slugSource = path.basename(workspaceRoot) || "workspace";
   const slug = slugSource.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "workspace";
   const hash = createHash("sha256").update(canonicalWorkspaceRoot).digest("hex").slice(0, 16);
-  const pluginDataDir = process.env[PLUGIN_DATA_ENV];
+  const pluginDataDir = process.env[KIMI_PLUGIN_DATA_ENV] ?? process.env[PLUGIN_DATA_ENV];
   const stateRoot = pluginDataDir ? path.join(pluginDataDir, "state") : FALLBACK_STATE_ROOT_DIR;
   return path.join(stateRoot, `${slug}-${hash}`);
 }

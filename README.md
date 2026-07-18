@@ -346,3 +346,7 @@ Yes. If you already use Kimi Code, the plugin picks up the same [configuration](
 ### Can I keep using my current API key or custom provider setup?
 
 Yes. Because the plugin uses your local Kimi Code CLI, your existing providers, sign-in method, and config still apply.
+
+### Can the Kimi and Codex plugins run side by side?
+
+Yes. Older releases could cross-wire the two: both plugins re-exported the generic `CLAUDE_PLUGIN_DATA` into the session environment, so one plugin's workers could resolve the other's state directory and reuse its cached broker — surfacing as `unknown variant` errors (e.g. `session/new` sent to Codex's broker). The plugin now keeps its state under a Kimi-specific pointer (`KIMI_COMPANION_PLUGIN_DATA`), only reuses broker sessions it can attribute to itself, and verifies the broker's identity during the ACP handshake — a foreign broker is rejected and the run falls back to a direct connection instead of failing. Cached sessions poisoned before this fix are discarded automatically on the next run.

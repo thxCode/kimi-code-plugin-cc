@@ -1,5 +1,5 @@
 /**
- * @typedef {Error & { data?: unknown, rpcCode?: number }} ProtocolError
+ * @typedef {Error & { data?: unknown, rpcCode?: number, foreignBroker?: boolean, acpClientTransport?: string, acpBrokerEndpoint?: string | null }} ProtocolError
  * @typedef {import("./acp-protocol").AcpMethod} AcpMethod
  * @typedef {import("./acp-protocol").AcpNotification} AcpNotification
  * @typedef {import("./acp-protocol").AcpNotificationHandler} AcpNotificationHandler
@@ -18,7 +18,7 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import readline from "node:readline";
 import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
-import { ensureBrokerSession, readBrokerSession } from "./broker-lifecycle.mjs";
+import { clearBrokerSession, ensureBrokerSession, readBrokerSession, readOwnBrokerSession } from "./broker-lifecycle.mjs";
 import { terminateProcessTree } from "./process.mjs";
 
 const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.meta.url);
@@ -69,6 +69,33 @@ function createProtocolError(message, data) {
 }
 
 /**
+ * The ACP peer must identify itself as Kimi — either a directly spawned
+ * `kimi acp` ("Kimi Code CLI") or this plugin's broker
+ * ("kimi-companion-broker"). A cached broker endpoint can point at a
+ * DIFFERENT agent's server (e.g. a sibling companion plugin whose broker
+ * session leaked into this state root via a shared CLAUDE_PLUGIN_DATA); its
+ * method set rejects session/new with "unknown variant" errors that are
+ * opaque to callers, so fail fast at the handshake instead.
+ */
+function assertKimiAcpPeer(initializeResult, transport, endpoint) {
+  const identities = [initializeResult?.agentInfo?.name, initializeResult?.userAgent];
+  if (identities.some((value) => typeof value === "string" && /kimi/i.test(value))) {
+    return;
+  }
+  const observed = identities.find((value) => typeof value === "string" && value) ?? "unidentified";
+  const subject = transport === "broker" ? `broker at ${endpoint}` : "kimi acp process";
+  const hint =
+    transport === "broker"
+      ? " A sibling agent plugin may be sharing this state directory; the cached broker session was rejected."
+      : " Check that the `kimi` binary on PATH is the Kimi Code CLI.";
+  const error = createProtocolError(
+    `The ${subject} is not a Kimi ACP server (it identifies as ${JSON.stringify(observed)}).${hint}`
+  );
+  error.foreignBroker = true;
+  throw error;
+}
+
+/**
  * Build the result for an ACP `session/request_permission` server request by
  * applying a permission policy to the offered options.
  * @param {SessionRequestPermissionParams} params
@@ -116,6 +143,8 @@ class KimiAcpClientBase {
     this.serverRequestHandler = null;
     this.lineBuffer = "";
     this.transport = "unknown";
+    /** @type {string | null} The broker endpoint when transport is "broker". */
+    this.endpoint = null;
 
     this.exitPromise = new Promise((resolve) => {
       this.resolveExit = resolve;
@@ -249,11 +278,12 @@ class KimiAcpClientBase {
 
   /** ACP handshake: initialize request followed by the initialized notification. */
   async performHandshake() {
-    await this.request("initialize", {
+    const initializeResult = await this.request("initialize", {
       protocolVersion: ACP_PROTOCOL_VERSION,
       clientInfo: this.options.clientInfo ?? DEFAULT_CLIENT_INFO,
       clientCapabilities: this.options.clientCapabilities ?? DEFAULT_CAPABILITIES
     });
+    assertKimiAcpPeer(initializeResult, this.transport, this.endpoint);
     this.notify("initialized", {});
   }
 
@@ -400,7 +430,7 @@ export class BrokerKimiAcpClient extends KimiAcpClientBase {
   constructor(cwd, options = {}) {
     super(cwd, options);
     this.transport = "broker";
-    this.endpoint = options.brokerEndpoint;
+    this.endpoint = options.brokerEndpoint ?? null;
   }
 
   async initialize() {
@@ -435,6 +465,14 @@ export class BrokerKimiAcpClient extends KimiAcpClientBase {
     this.closed = true;
     if (this.socket) {
       this.socket.end();
+      setTimeout(() => {
+        // A peer that never closes its side (e.g. a foreign broker this
+        // client is rejecting) would otherwise keep `exitPromise` pending
+        // forever; destroy forces the close event so close() can finish.
+        if (this.socket && !this.socket.destroyed) {
+          this.socket.destroy();
+        }
+      }, 50).unref?.();
     }
     await this.exitPromise;
   }
@@ -460,7 +498,7 @@ export class KimiAcpClient {
     if (!options.disableBroker) {
       brokerEndpoint = options.brokerEndpoint ?? options.env?.[BROKER_ENDPOINT_ENV] ?? process.env[BROKER_ENDPOINT_ENV] ?? null;
       if (!brokerEndpoint && options.reuseExistingBroker) {
-        brokerEndpoint = readBrokerSession(cwd)?.endpoint ?? null;
+        brokerEndpoint = readOwnBrokerSession(cwd)?.endpoint ?? null;
       }
       if (!brokerEndpoint && !options.reuseExistingBroker) {
         const brokerSession = await ensureBrokerSession(cwd, { env: options.env });
@@ -470,15 +508,31 @@ export class KimiAcpClient {
     const client = brokerEndpoint
       ? new BrokerKimiAcpClient(cwd, { ...options, brokerEndpoint })
       : new SpawnedKimiAcpClient(cwd, options);
-    await client.initialize();
+    try {
+      await client.initialize();
+    } catch (error) {
+      // A failed handshake can leave a connected-but-rejected transport (a
+      // foreign broker never closes its socket); always release it so the
+      // process does not hang on exit, and tag the error so withAcpClient
+      // can still apply its broker fallbacks.
+      if (error instanceof Error) {
+        const tagged = /** @type {ProtocolError} */ (error);
+        tagged.acpClientTransport = client.transport;
+        tagged.acpBrokerEndpoint = client.endpoint ?? null;
+      }
+      await client.close().catch(() => {});
+      throw error;
+    }
     return client;
   }
 }
 
 /**
  * Run `fn` with a connected client, transparently retrying with a direct
- * spawned client when the broker connection is missing (ENOENT/ECONNREFUSED)
- * or the broker reports itself busy (rpc code -32001).
+ * spawned client when the broker connection is missing (ENOENT/ECONNREFUSED),
+ * the broker reports itself busy (rpc code -32001), or the cached broker
+ * turns out to be a foreign agent's server (poisoned session cache — the
+ * stale record is cleared before falling back).
  * @template T
  * @param {string} cwd
  * @param {(client: SpawnedKimiAcpClient | BrokerKimiAcpClient) => Promise<T>} fn
@@ -493,11 +547,20 @@ export async function withAcpClient(cwd, fn, options = {}) {
     await client.close();
     return result;
   } catch (error) {
-    const brokerRequested =
-      client?.transport === "broker" || Boolean(options.env?.[BROKER_ENDPOINT_ENV] ?? process.env[BROKER_ENDPOINT_ENV]);
+    const explicitBrokerEndpoint = Boolean(
+      options.brokerEndpoint ?? options.env?.[BROKER_ENDPOINT_ENV] ?? process.env[BROKER_ENDPOINT_ENV]
+    );
+    // When connect() itself fails the client is never assigned here; its
+    // transport/endpoint travel on the error instead.
+    const failedTransport = client?.transport ?? error?.acpClientTransport ?? null;
+    const failedBrokerEndpoint = client?.endpoint ?? error?.acpBrokerEndpoint ?? null;
+    const brokerRequested = failedTransport === "broker" || explicitBrokerEndpoint;
+    const foreignBroker = error?.foreignBroker === true && failedTransport === "broker" && !explicitBrokerEndpoint;
     const shouldRetryDirect =
-      (client?.transport === "broker" && error?.rpcCode === BROKER_BUSY_RPC_CODE) ||
+      foreignBroker ||
+      (failedTransport === "broker" && error?.rpcCode === BROKER_BUSY_RPC_CODE) ||
       (brokerRequested && (error?.code === "ENOENT" || error?.code === "ECONNREFUSED"));
+    const rejectedBrokerEndpoint = foreignBroker ? failedBrokerEndpoint : null;
 
     if (client) {
       await client.close().catch(() => {});
@@ -506,6 +569,16 @@ export async function withAcpClient(cwd, fn, options = {}) {
 
     if (!shouldRetryDirect) {
       throw error;
+    }
+
+    if (rejectedBrokerEndpoint) {
+      // Drop the poisoned cache entry — but only if it still points at the
+      // endpoint we just rejected, so a concurrently respawned valid broker
+      // session is not deleted.
+      const cached = readBrokerSession(cwd);
+      if (cached?.endpoint === rejectedBrokerEndpoint) {
+        clearBrokerSession(cwd);
+      }
     }
 
     const directClient = await KimiAcpClient.connect(cwd, { ...options, disableBroker: true });
