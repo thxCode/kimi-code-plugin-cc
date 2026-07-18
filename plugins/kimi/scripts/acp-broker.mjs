@@ -92,6 +92,9 @@ async function main() {
   // Upstream server->client request ids forwarded to each downstream socket,
   // so responses coming back can be routed to the upstream agent.
   const forwardedUpstreamIds = new Map();
+  // sessionId of the in-flight streaming (session/prompt) request per socket,
+  // so a dead stream owner can have its orphaned upstream turn cancelled.
+  const streamSessionBySocket = new Map();
 
   function trackForwardedId(socket, id) {
     let ids = forwardedUpstreamIds.get(socket);
@@ -115,6 +118,8 @@ async function main() {
   }
 
   function clearSocketOwnership(socket) {
+    const orphanedStreamSession = streamSessionBySocket.get(socket) ?? null;
+    streamSessionBySocket.delete(socket);
     if (activeRequestSocket === socket) {
       activeRequestSocket = null;
     }
@@ -123,6 +128,12 @@ async function main() {
     }
     if (lastActiveSocket === socket) {
       lastActiveSocket = null;
+    }
+    if (orphanedStreamSession) {
+      // The client that owned an in-flight streaming turn is gone; cancel the
+      // orphaned upstream turn so it does not keep burning tokens with no
+      // consumer, and so a later client is not routed its stale updates.
+      appClient.notify(CANCEL_METHOD, { sessionId: orphanedStreamSession });
     }
     const ids = forwardedUpstreamIds.get(socket);
     if (ids) {
@@ -264,6 +275,9 @@ async function main() {
         lastActiveSocket = socket;
         if (isStreaming) {
           activeStreamSocket = socket;
+          if (typeof message.params?.sessionId === "string") {
+            streamSessionBySocket.set(socket, message.params.sessionId);
+          }
         }
 
         try {
@@ -282,6 +296,7 @@ async function main() {
           if (activeStreamSocket === socket) {
             activeStreamSocket = null;
           }
+          streamSessionBySocket.delete(socket);
         }
       }
     });

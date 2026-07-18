@@ -28,6 +28,9 @@ import { scrubEnv, writeExecutable } from "./helpers.mjs";
 // - "permission-request": every prompt first emits a tool_call update and a
 //   server->client session/request_permission request, then waits for the
 //   client's answer before finishing the turn.
+// - "wedged-task": prompts are recorded but never answered and never stream
+//   updates (the black-holed upstream-request hang mode); session/cancel is
+//   recorded but does not resolve the turn.
 // - "transfer": prompts that look like a transferred Claude transcript
 //   ("## User"/"## Assistant" blocks or "transferred Claude") are recorded in
 //   state.lastTransfer and answered with a transfer acknowledgement.
@@ -348,6 +351,12 @@ function handlePrompt(message, state) {
     completePrompt(session.id, message.id, kind, payload);
   };
 
+  if (BEHAVIOR === "wedged-task") {
+    // Never answer: simulates an upstream LLM request that black-holes.
+    // session/cancel is still recorded by the cancel handler, but the
+    // in-flight prompt never resolves.
+    return;
+  }
   if (BEHAVIOR === "interruptible-slow-task") {
     const timer = setTimeout(() => {
       interruptiblePrompts.delete(session.id);

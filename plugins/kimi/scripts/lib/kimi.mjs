@@ -52,6 +52,16 @@ const DEFAULT_CONTINUE_PROMPT =
 const KIMI_UNAVAILABLE_MESSAGE =
   "Kimi Code CLI is not installed or is missing required runtime support. Install it from https://moonshotai.github.io/kimi-code/, then rerun `/kimi:setup`.";
 
+// Stall watchdog: a turn that streams nothing at all is almost always a
+// black-holed upstream request (observed: kimi acp logs "llm request" and
+// then nothing for 6+ minutes). Heartbeat-log after STALL_WARN_MS of
+// silence, auto-cancel after STALL_TIMEOUT_MS; 0 disables either knob.
+const STALL_TIMEOUT_ENV = "KIMI_COMPANION_STALL_TIMEOUT_MS";
+const STALL_WARN_ENV = "KIMI_COMPANION_STALL_WARN_MS";
+const DEFAULT_STALL_TIMEOUT_MS = 600000;
+const DEFAULT_STALL_WARN_MS = 120000;
+const STALL_TICK_MS = 250;
+
 // toolCall.kind values that mutate the workspace: tracked as touched files and
 // rejected under the read-only permission policy.
 const FILE_MUTATION_TOOL_KINDS = new Set(["edit", "delete", "move"]);
@@ -66,6 +76,62 @@ function cleanKimiStderr(stderr) {
     .map((line) => line.trimEnd())
     .filter((line) => line && !line.startsWith("WARNING: proceeding, even though we could not update PATH:"))
     .join("\n");
+}
+
+function resolveStallBudget(optionValue, envValue, fallback) {
+  const raw = optionValue ?? envValue;
+  if (raw === undefined || raw === null || raw === "") {
+    return fallback;
+  }
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : fallback;
+}
+
+function formatSilenceDuration(ms) {
+  const totalSeconds = Math.max(1, Math.round(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
+}
+
+/**
+ * Watch a turn for total upstream silence. Every STALL_WARN_MS of quiet logs
+ * a heartbeat (and flips the job phase to "waiting" so /kimi:status stops
+ * saying "starting"); after STALL_TIMEOUT_MS it resolves {stalled: true} so
+ * the caller can cancel the turn and fail the job instead of hanging forever.
+ */
+function startStallWatchdog({ timeoutMs, warnMs, onHeartbeat }) {
+  let lastActivityAt = Date.now();
+  let lastHeartbeatAt = 0;
+  let resolveStall;
+  const promise = new Promise((resolve) => {
+    resolveStall = resolve;
+  });
+
+  const timer = setInterval(() => {
+    const silentMs = Date.now() - lastActivityAt;
+    if (timeoutMs > 0 && silentMs >= timeoutMs) {
+      clearInterval(timer);
+      resolveStall({ stalled: true, silentMs });
+      return;
+    }
+    if (warnMs > 0 && silentMs >= warnMs && Date.now() - lastHeartbeatAt >= warnMs) {
+      lastHeartbeatAt = Date.now();
+      onHeartbeat(silentMs, timeoutMs);
+    }
+  }, STALL_TICK_MS);
+  // The watchdog must never keep the host process alive on its own.
+  timer.unref?.();
+
+  return {
+    promise,
+    touch() {
+      lastActivityAt = Date.now();
+    },
+    stop() {
+      clearInterval(timer);
+    }
+  };
 }
 
 function shorten(text, limit = 72) {
@@ -673,7 +739,9 @@ function finalizeTurnCapture(state, options = {}) {
 
 /**
  * Send one prompt and aggregate its session/update stream until the
- * session/prompt response resolves the turn.
+ * session/prompt response resolves the turn — or until the stall watchdog
+ * fires (no session traffic at all for STALL_TIMEOUT_MS), in which case the
+ * turn is cancelled upstream and reported as an error instead of hanging.
  * @param {import("./acp-client.mjs").SpawnedKimiAcpClient | import("./acp-client.mjs").BrokerKimiAcpClient} client
  * @param {string} sessionId
  * @param {string} promptText
@@ -682,9 +750,22 @@ async function captureAcpTurn(client, sessionId, promptText, options = {}) {
   const state = createTurnCaptureState(sessionId, options);
   const previousHandler = client.notificationHandler;
 
+  const timeoutMs = resolveStallBudget(options.stallTimeoutMs, process.env[STALL_TIMEOUT_ENV], DEFAULT_STALL_TIMEOUT_MS);
+  const warnMs = resolveStallBudget(options.stallWarnMs, process.env[STALL_WARN_ENV], DEFAULT_STALL_WARN_MS);
+  const watchdog = startStallWatchdog({
+    timeoutMs,
+    warnMs,
+    onHeartbeat: (silentMs) => {
+      const waited = formatSilenceDuration(silentMs);
+      const budget = timeoutMs > 0 ? `; auto-cancel after ${formatSilenceDuration(timeoutMs)} of silence` : "";
+      emitProgress(state.onProgress, `No output from Kimi for ${waited}${budget}.`, "waiting");
+    }
+  });
+
   client.setNotificationHandler((/** @type {AcpNotification} */ message) => {
     const params = /** @type {any} */ (message?.params);
     if (message?.method === "session/update" && (!params?.sessionId || params.sessionId === sessionId)) {
+      watchdog.touch();
       applySessionUpdate(state, params.update);
       return;
     }
@@ -694,11 +775,40 @@ async function captureAcpTurn(client, sessionId, promptText, options = {}) {
   });
 
   try {
-    const result = await client.prompt(sessionId, promptText);
-    state.stopReason = typeof result?.stopReason === "string" ? result.stopReason : null;
+    const promptPromise = client.prompt(sessionId, promptText);
+    // The stall watchdog abandons the prompt promise; swallow its late
+    // settlement so an upstream reply arriving after the timeout cannot
+    // surface as an unhandled rejection.
+    const settled = await Promise.race([
+      promptPromise.then(
+        (result) => ({ result }),
+        (error) => ({ error })
+      ),
+      watchdog.promise
+    ]);
+    promptPromise.catch(() => {});
+
+    if (settled?.stalled) {
+      try {
+        client.cancelSession(sessionId);
+      } catch {
+        // Best effort: the upstream may already be unreachable.
+      }
+      state.error = new Error(
+        `Kimi produced no output for ${formatSilenceDuration(settled.silentMs)}; the stalled turn was cancelled. ` +
+          `The upstream kimi acp request appears wedged (network/API). Retry the job; if it persists, ` +
+          `restart the shared Kimi broker or check the connection to the Kimi API. ` +
+          `Tune or disable via ${STALL_TIMEOUT_ENV}.`
+      );
+    } else if (settled?.error) {
+      state.error = settled.error;
+    } else {
+      state.stopReason = typeof settled?.result?.stopReason === "string" ? settled.result.stopReason : null;
+    }
   } catch (error) {
     state.error = error;
   } finally {
+    watchdog.stop();
     client.setNotificationHandler(previousHandler ?? null);
   }
 

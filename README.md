@@ -312,6 +312,15 @@ This plugin is a port of OpenAI's Codex plugin for Claude Code. The command surf
 - **Transfer seeds a new session.** `/kimi:transfer` condenses the Claude transcript into a seed prompt for a new Kimi session — lossy, and it costs one prompt — instead of Codex's native session import.
 - **Read-only is enforced by permission policy.** Review runs are kept read-only through Kimi's permission policy rather than an OS-level sandbox.
 
+### Will a stuck Kimi run hang my job forever?
+
+No. Every turn is watched for total upstream silence (no streamed output at all):
+
+- After `KIMI_COMPANION_STALL_WARN_MS` (default `120000`, 2 minutes) of silence the job logs a heartbeat and its phase flips to `waiting`, so `/kimi:status` no longer misleadingly shows `starting`.
+- After `KIMI_COMPANION_STALL_TIMEOUT_MS` (default `600000`, 10 minutes) of silence the turn is cancelled upstream and the job fails with a clear "stalled turn was cancelled" error instead of hanging forever.
+
+Set either variable to `0` to disable that knob. If a background worker is killed without `/kimi:cancel`, the shared broker also cancels the orphaned upstream turn on its own.
+
 ## FAQ
 
 ### Do I need a separate Kimi account for this plugin?

@@ -13,6 +13,7 @@ import { fileURLToPath } from "node:url";
 import { buildEnv, installFakeKimi } from "./fake-kimi-fixture.mjs";
 import { initGitRepo, makeTempDir, run, scrubEnv } from "./helpers.mjs";
 import { readBrokerSession, saveBrokerSession } from "../plugins/kimi/scripts/lib/broker-lifecycle.mjs";
+import { terminateProcessTree } from "../plugins/kimi/scripts/lib/process.mjs";
 import { resolveStateDir } from "../plugins/kimi/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -1538,6 +1539,91 @@ test("cancel sends a session interrupt to the shared broker before killing a bro
   assert.deepEqual(fakeState.lastCancel, {
     sessionId: runningJob.sessionId
   });
+
+  const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({
+      hook_event_name: "SessionEnd",
+      cwd: repo
+    })
+  });
+  assert.equal(cleanup.status, 0, cleanup.stderr);
+});
+
+// --- transfer ---------------------------------------------------------------
+
+test("task auto-cancels a wedged turn that streams nothing and fails the job", (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeKimi(binDir, "wedged-task");
+  const { env } = makeTestEnv(t, binDir, {
+    KIMI_COMPANION_STALL_TIMEOUT_MS: "1500",
+    KIMI_COMPANION_STALL_WARN_MS: "400"
+  });
+  scheduleBrokerCleanup(t, repo, env);
+  initRepoWithCommit(repo);
+
+  const result = run("node", [SCRIPT, "task", "diagnose the wedged upstream"], {
+    cwd: repo,
+    env
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stdout, /stalled turn was cancelled/);
+
+  const stateDir = resolveStateDir(repo);
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  assert.equal(state.jobs[0].status, "failed");
+  assert.equal(state.jobs[0].phase, "failed");
+
+  const log = fs.readFileSync(state.jobs[0].logFile, "utf8");
+  assert.match(log, /No output from Kimi for/);
+  assert.match(log, /stalled turn was cancelled/);
+
+  // The watchdog cancels the upstream turn so it does not keep running.
+  const fakeState = readFakeState(binDir);
+  assert.equal(fakeState.lastCancel?.sessionId, state.jobs[0].sessionId);
+});
+
+test("broker cancels the orphaned upstream turn when a streaming worker dies", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeKimi(binDir, "interruptible-slow-task");
+  const { env } = makeTestEnv(t, binDir);
+  scheduleBrokerCleanup(t, repo, env);
+  initRepoWithCommit(repo);
+
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "investigate the orphaned worker"], {
+    cwd: repo,
+    env
+  });
+
+  assert.equal(launched.status, 0, launched.stderr);
+  const jobId = JSON.parse(launched.stdout).jobId;
+  assert.ok(jobId);
+
+  const stateDir = resolveStateDir(repo);
+  const runningJob = await waitFor(() => {
+    const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+    const job = state.jobs.find((candidate) => candidate.id === jobId);
+    if (job?.status === "running" && job.sessionId && job.pid) {
+      return job;
+    }
+    return null;
+  }, { timeoutMs: 15000 });
+
+  // Wait until the worker's prompt is actually streaming upstream, then kill
+  // the worker process outright (no /kimi:cancel interrupt) so the broker
+  // must clean up the orphaned turn on its own.
+  await waitFor(() => {
+    const fakeState = readFakeState(binDir);
+    return fakeState.lastPrompt?.sessionId === runningJob.sessionId ? true : null;
+  }, { timeoutMs: 15000 });
+  terminateProcessTree(runningJob.pid);
+
+  const cancel = await waitFor(() => readFakeState(binDir).lastCancel ?? null, { timeoutMs: 15000 });
+  assert.equal(cancel.sessionId, runningJob.sessionId);
 
   const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
     cwd: repo,
