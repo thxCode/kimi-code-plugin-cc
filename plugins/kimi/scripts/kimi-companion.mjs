@@ -23,7 +23,7 @@ import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
-import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
+import { loadPromptTemplate, interpolateTemplate, readClaudeConfiguredLanguage } from "./lib/prompts.mjs";
 import {
   generateJobId,
   getConfig,
@@ -248,10 +248,14 @@ async function handleSetup(argv) {
 
 function buildReviewPrompt(context, { reviewName, focusText }) {
   const template = loadPromptTemplate(ROOT_DIR, reviewName === "Adversarial Review" ? "adversarial-review" : "review");
+  const language = readClaudeConfiguredLanguage(context.repoRoot);
   const variables = {
     TARGET_LABEL: context.target.label,
     REVIEW_COLLECTION_GUIDANCE: context.collectionGuidance,
-    REVIEW_INPUT: context.content
+    REVIEW_INPUT: context.content,
+    OUTPUT_LANGUAGE_CONTRACT: language
+      ? `Write all prose fields (summary, finding titles and bodies, recommendations) in ${language}, the user's configured language. Keep code, file paths, and identifiers unchanged.`
+      : "Write all prose fields in the same language as the repository context."
   };
   if (reviewName === "Adversarial Review") {
     variables.USER_FOCUS = focusText || "No extra focus provided.";

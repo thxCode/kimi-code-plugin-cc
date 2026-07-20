@@ -16,6 +16,7 @@ Core rules:
 - Add explicit grounding and verification rules for any task where unsupported guesses would hurt quality.
 - Prefer better prompt contracts over raising reasoning or adding long natural-language explanations.
 - Use XML tags consistently so the prompt has stable internal structure.
+- The final answer's language follows the user, not the prompt. When the conversation with the user is in a non-English language, keep the `<task>` text in that language and add an explicit output-language instruction (for example `<output_language>Write the final answer in Chinese.</output_language>`). English XML scaffolding is fine; an English final answer to a non-English conversation is not — it drags the whole Claude session away from the user's configured language.
 
 Default prompt recipe:
 - `<task>`: the concrete job and the relevant repository or failure context.

@@ -7,6 +7,7 @@ user-invocable: false
 # Kimi Result Handling
 
 When the helper returns Kimi output:
+- Present in the user's configured language. If Kimi's output arrived in a different language, faithfully render it in the user's language: keep the structure, severity ordering, `file:line` references, code snippets, and quoted evidence exactly as reported; translate only the prose. Never let an English helper reply pull the conversation away from the user's language.
 - Preserve the helper's verdict, summary, findings, and next steps structure.
 - For review output, present findings first and keep them ordered by severity.
 - Use the file paths and line numbers exactly as the helper reports them.
